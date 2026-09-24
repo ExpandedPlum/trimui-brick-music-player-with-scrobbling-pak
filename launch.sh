@@ -10,6 +10,7 @@ set -x
 
 echo "$0" "$@"
 cd "$PAK_DIR" || exit 1
+PAK_DIR="$(pwd)"
 mkdir -p "$USERDATA_PATH/$PAK_NAME"
 
 cleanup() {
@@ -18,38 +19,37 @@ cleanup() {
     # musicserver must keep running so background music continues to the next song.
 }
 
-start_scrobble_monitor() {
-    # Kill any stale monitor instance from a previous session
-    if [ -f /tmp/scrobble_monitor.pid ]; then
-        OLD_PID=$(cat /tmp/scrobble_monitor.pid 2>/dev/null)
-        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-            kill "$OLD_PID" 2>/dev/null
-            sleep 1
-        fi
-        rm -f /tmp/scrobble_monitor.pid
+# The scrobble setting lives in the userdata folder so it survives pak updates.
+# It is seeded from the default that ships with the pak on first launch.
+scrobble_enabled() {
+    SCROBBLE_CONFIG="$USERDATA_PATH/$PAK_NAME/scrobble_enabled"
+    if [ ! -f "$SCROBBLE_CONFIG" ]; then
+        cp "$PAK_DIR/scrobble_enabled" "$SCROBBLE_CONFIG" 2>/dev/null || echo 0 >"$SCROBBLE_CONFIG"
     fi
+    SCROBBLE_ON=$(tr -dc '01' <"$SCROBBLE_CONFIG" 2>/dev/null | head -c1)
+    [ "${SCROBBLE_ON:-0}" = "1" ]
+}
 
-    # Start the scrobble monitor as a background daemon. Trap '' HUP makes it
-    # immune to SIGHUP when the pak exits (nohup/setsid aren't available on BusyBox).
+start_scrobble_monitor() {
+    # Start the scrobble monitor as a background daemon; it exits on its own if an
+    # instance is already running, so the current track's progress is kept.
+    # Trap '' HUP makes it immune to SIGHUP when the pak exits (nohup/setsid aren't
+    # available on BusyBox).
     [ -x "$PAK_DIR/scrobble_monitor.sh" ] || chmod +x "$PAK_DIR/scrobble_monitor.sh"
-    (trap '' HUP; exec "$PAK_DIR/scrobble_monitor.sh") </dev/null >/dev/null 2>&1 &
-
-    echo "Scrobble monitor started (PID will be written to /tmp/scrobble_monitor.pid)"
+    SCROBBLE_MONITOR_LOG="$LOGS_PATH/$PAK_NAME Scrobbler.txt"
+    export SCROBBLE_MONITOR_LOG
+    (trap '' HUP; exec "$PAK_DIR/scrobble_monitor.sh") </dev/null &
 }
 
 main() {
     echo "1" >/tmp/stay_awake
     trap "cleanup" EXIT INT TERM HUP QUIT
 
-    # Scrobble toggle: only start monitor if explicitly enabled
-    # The scrobble_enabled file ships with the pak (default: 0 = disabled)
-    SCROBBLE_CONFIG="$PAK_DIR/scrobble_enabled"
-    SCROBBLE_ON=$(cat "$SCROBBLE_CONFIG" 2>/dev/null | tr -dc '01' | head -c1)
-    SCROBBLE_ON="${SCROBBLE_ON:-0}"
-    if [ "$SCROBBLE_ON" = "1" ]; then
+    if scrobble_enabled; then
         start_scrobble_monitor
     else
         echo "Scrobbling disabled (set $SCROBBLE_CONFIG to 1 to enable)"
+        sh "$PAK_DIR/scrobble_monitor.sh" stop
     fi
 
     # Ensure /usr/trimui/lib is in LD_LIBRARY_PATH — musicserver needs libSDL-1.2.so.0 from there.
@@ -72,7 +72,8 @@ main() {
     # /tmp/stay_alive on exit which tells musicserver to stop, killing background playback.
     # We keep stay_alive so musicserver continues advancing through the queue.
     echo 1 > /tmp/stay_alive
-    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$(pwd)"
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$(pwd)"
+    export LD_LIBRARY_PATH
     ./musicplayer
 }
 
